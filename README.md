@@ -38,12 +38,13 @@ Search tip: CORE matches any of your words unless you use quotes or AND, e.g.
 
 ## Connect it to Claude Code
 
-Run once in PowerShell:
+Already set up on this computer (private to this project). To set it up again, run once in PowerShell:
 
 ```powershell
-claude mcp add --transport stdio provenance-core -- node "C:\Users\abacs\provenance\src\agentServer.ts"
+claude mcp add --transport stdio provenance-core -- "C:\Program Files\nodejs\node.exe" "C:\Users\abacs\provenance\src\agentServer.ts"
 ```
 
+The full path to `node.exe` matters: VS Code may not see Node on its PATH until Windows restarts.
 Then reload Claude Code. Claude gets three tools: `search_sources`, `get_source`, `read_source_text`.
 After any update that adds tools, reload Claude Code again.
 
