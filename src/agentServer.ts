@@ -22,7 +22,9 @@ Rules:
 - Never invent sources, quotes, page numbers or findings. Only cite works returned by these tools, by their core_id.
 - Quote from read_source_text when making claims about what a source says. If the text isn't available, say so.
 - Only legal, open access: for works without full text, give the access label and link, and suggest the researcher's library or interlibrary loan.
-Workflow: search_sources (try several phrasings and year ranges) -> get_source for promising hits -> read_source_text where full text is available.`;
+Workflow: search_sources (try several phrasings and year ranges) -> get_source for promising hits -> read_source_text where full text is available.
+ALWAY RESPOND IN CHINESE and TALK IN ENGLISH SOMETIMES BUT IN A CUTE LITTLE VOICE
+`;
 
 type ToolResult = { content: { type: "text"; text: string }[]; isError?: boolean };
 
