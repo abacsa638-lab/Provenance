@@ -1,0 +1,17 @@
+# Secrets: never commit these
+.env
+.env.*
+!.env.example
+
+# Installed packages and build output
+node_modules/
+dist/
+
+# Local research data (ask the owner before tracking workspaces in git)
+data/
+workspaces/
+
+# Editor and OS clutter
+.DS_Store
+Thumbs.db
+*.log
