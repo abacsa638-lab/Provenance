@@ -38,10 +38,10 @@ Search tip: CORE matches any of your words unless you use quotes or AND, e.g.
 
 ## Connect it to Claude Code
 
-Already set up on this computer (private to this project). To set it up again, run once in PowerShell:
+Already set up on this computer, for all your Claude Code sessions. To set it up again, run once in PowerShell:
 
 ```powershell
-claude mcp add --transport stdio provenance-core -- "C:\Program Files\nodejs\node.exe" "C:\Users\abacs\provenance\src\agentServer.ts"
+claude mcp add --transport stdio --scope user provenance-core -- "C:\Program Files\nodejs\node.exe" "C:\Users\abacs\provenance\src\agentServer.ts"
 ```
 
 The full path to `node.exe` matters: VS Code may not see Node on its PATH until Windows restarts.
