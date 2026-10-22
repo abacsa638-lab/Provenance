@@ -8,7 +8,15 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, it } from "node:test";
 import { loadConfig, type Config } from "../src/config.ts";
-import { buildQuery, CoreApiError, CoreClient, type Transport, type TransportResponse } from "../src/coreClient.ts";
+import {
+  buildQuery,
+  CoreApiError,
+  CoreClient,
+  parseResetTime as parseResetTimeForTest,
+  type Transport,
+  type TransportResponse,
+} from "../src/coreClient.ts";
+import { DiskCache } from "../src/diskCache.ts";
 import { chicagoCitation, FULL_TEXT_PLACEHOLDER, sourceFromCore } from "../src/models.ts";
 
 // ---------- helpers ----------
@@ -41,7 +49,7 @@ const SAMPLE_WORK = {
 };
 
 function ok(data: unknown): TransportResponse {
-  return { status: 200, body: JSON.stringify(data), retryAfter: null };
+  return { status: 200, body: JSON.stringify(data), headers: {} };
 }
 
 /** A fake internet: replies with the queued responses in order, and records each request. */
@@ -74,7 +82,7 @@ function fakeTime() {
 function makeClient(responses: (TransportResponse | Error)[], config: Partial<Config> = {}) {
   const fake = fakeTransport(responses);
   const time = fakeTime();
-  const client = new CoreClient({ config: { ...TEST_CONFIG, ...config }, transport: fake.transport, ...time });
+  const client = new CoreClient({ config: { ...TEST_CONFIG, ...config }, transport: fake.transport, diskCache: null, ...time });
   return { client, calls: fake.calls, sleeps: time.sleeps };
 }
 
@@ -181,8 +189,8 @@ describe("CORE client", () => {
 
   it("backs off and retries after a 429, honouring Retry-After", async () => {
     const { client, calls, sleeps } = makeClient([
-      { status: 429, body: "", retryAfter: "7" },
-      { status: 503, body: "", retryAfter: null },
+      { status: 429, body: "", headers: { "retry-after": "7" } },
+      { status: 503, body: "", headers: {} },
       ok({ totalHits: 1, results: [SAMPLE_WORK] }),
     ]);
     const result = await client.search("strike");
@@ -193,10 +201,10 @@ describe("CORE client", () => {
   });
 
   it("gives a friendly error when retries run out or the key is wrong", async () => {
-    const busy = makeClient(Array(4).fill({ status: 429, body: "", retryAfter: null }));
+    const busy = makeClient(Array(4).fill({ status: 429, body: "", headers: {} }));
     await assert.rejects(busy.client.search("x"), /limiting how fast/);
 
-    const badKey = makeClient([{ status: 401, body: "", retryAfter: null }]);
+    const badKey = makeClient([{ status: 401, body: "", headers: {} }]);
     await assert.rejects(badKey.client.search("x"), (error: unknown) => {
       assert.ok(error instanceof CoreApiError);
       assert.match(error.message, /rejected the API key/);
@@ -222,9 +230,66 @@ describe("CORE client", () => {
     assert.match(missing.message, /core\.ac\.uk\/download\/4242\.pdf/);
   });
 
+  it("follows CORE's own rate-limit headers", async () => {
+    // CORE says: no requests left until 10 s from now (on the fake clock).
+    const exhausted = { "x-ratelimit-remaining": "0", "x-ratelimit-retry-after": "1970-01-01T00:00:10+0000" };
+    const { client, sleeps } = makeClient([
+      { status: 200, body: JSON.stringify({ totalHits: 0, results: [] }), headers: exhausted },
+      { status: 429, body: "", headers: { ...exhausted, "x-ratelimit-retry-after": "1970-01-01T00:00:30+0000" } },
+      ok({ totalHits: 0, results: [] }),
+    ]);
+    await client.search("first");
+    await client.search("second");
+    // Waits until 10.5 s before the second request, then until 30.5 s after the 429.
+    assert.deepEqual(sleeps, [10_500, 20_000]);
+    assert.equal(parseResetTimeForTest("2026-10-22T01:05:42+0000"), Date.UTC(2026, 9, 22, 1, 5, 42));
+  });
+
+  it("gives up with a clear time instead of waiting minutes for the allowance", async () => {
+    const farFuture = { "x-ratelimit-remaining": "0", "x-ratelimit-retry-after": "1970-01-01T00:10:00+0000" };
+    const { client, calls } = makeClient([{ status: 429, body: "", headers: farFuture }]);
+    await assert.rejects(client.search("x"), /allowance is used up\. Try again after about/);
+    assert.equal(calls.length, 1);
+  });
+
+  it("retries a server error only once", async () => {
+    const { client, calls } = makeClient(Array(4).fill({ status: 500, body: "", headers: {} }));
+    await assert.rejects(client.search("x"), /server error/);
+    assert.equal(calls.length, 2);
+  });
+
   it("refuses IDs that could tamper with the URL", async () => {
     const { client, calls } = makeClient([]);
     await assert.rejects(client.getWork("../search/works?q=x"), /doesn't look like a CORE ID/);
     assert.equal(calls.length, 0);
+  });
+});
+
+describe("disk cache", () => {
+  it("remembers answers between sessions and forgets them after 7 days", async () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "provenance-cache-"));
+    let clock = 1_000_000;
+    const cache = new DiskCache({ dir, now: () => clock });
+    const fake = fakeTransport([ok({ totalHits: 3, results: [] }), ok({ totalHits: 4, results: [] })]);
+    const makeSession = () =>
+      new CoreClient({ config: TEST_CONFIG, transport: fake.transport, diskCache: cache, sleep: async () => {}, now: () => clock });
+
+    assert.equal((await makeSession().search("chartism")).totalHits, 3);
+    assert.equal((await makeSession().search("chartism")).totalHits, 3, "a new session reads from disk");
+    assert.equal(fake.calls.length, 1);
+
+    clock += 8 * 24 * 60 * 60 * 1000;
+    assert.equal((await makeSession().search("chartism")).totalHits, 4, "stale after 7 days");
+    assert.equal(fake.calls.length, 2);
+  });
+
+  it("keeps keyed and keyless answers apart", async () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "provenance-cache-"));
+    const cache = new DiskCache({ dir });
+    const fake = fakeTransport([ok({ totalHits: 1, results: [] }), ok({ totalHits: 2, results: [] })]);
+    const session = (coreApiKey: string | null) =>
+      new CoreClient({ config: { ...TEST_CONFIG, coreApiKey }, transport: fake.transport, diskCache: cache, sleep: async () => {} });
+    assert.equal((await session(null).search("x")).totalHits, 1);
+    assert.equal((await session("k").search("x")).totalHits, 2);
   });
 });

@@ -15,6 +15,7 @@ async function connect(transport: Transport) {
   const core = new CoreClient({
     config: { coreApiKey: null, coreBaseUrl: "https://api.example.test/v3", minIntervalMs: 0, maxRetries: 0, timeoutMs: 1000 },
     transport,
+    diskCache: null,
     sleep: async () => {},
   });
   const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();
@@ -31,7 +32,7 @@ function parse(result: Awaited<ReturnType<Client["callTool"]>>) {
 
 describe("agent server", () => {
   it("offers the three CORE tools", async () => {
-    const client = await connect(async () => ({ status: 200, body: "{}", retryAfter: null }));
+    const client = await connect(async () => ({ status: 200, body: "{}", headers: {} }));
     const { tools } = await client.listTools();
     assert.deepEqual(tools.map((t) => t.name).sort(), ["get_source", "read_source_text", "search_sources"]);
   });
@@ -40,7 +41,7 @@ describe("agent server", () => {
     const client = await connect(async (url) => ({
       status: 200,
       body: JSON.stringify(url.includes("/search/") ? { totalHits: 1, results: [WORK] } : WORK),
-      retryAfter: null,
+      headers: {},
     }));
     const search = parse(await client.callTool({ name: "search_sources", arguments: { query: "ten hours" } }));
     assert.equal(search.total_hits, 1);
@@ -52,7 +53,7 @@ describe("agent server", () => {
   });
 
   it("returns a plain-English error instead of crashing", async () => {
-    const client = await connect(async () => ({ status: 404, body: "", retryAfter: null }));
+    const client = await connect(async () => ({ status: 404, body: "", headers: {} }));
     const result = await client.callTool({ name: "get_source", arguments: { core_id: "123" } });
     assert.equal(result.isError, true);
     assert.deepEqual(parse(result), { error: "CORE has no work with that ID." });

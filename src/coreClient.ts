@@ -1,13 +1,15 @@
 // SECTION 3: Talking to CORE
 // CoreClient is the only part of Provenance that contacts the CORE API. It:
 //   - searches for works, fetches one work, and fetches a work's full text;
-//   - waits at least 1.5 seconds between requests so we stay inside the free-tier limit;
+//   - paces itself: at least 1.5 seconds between requests, and when CORE says our allowance
+//     (10 requests a minute) is used up, it waits until CORE says we may continue;
 //   - retries politely when CORE says "too many requests" (429) or has a server error (5xx);
-//   - remembers answers it has already fetched (in memory, for this session);
+//   - remembers answers: in memory for this session, and on disk for 7 days (data/cache/);
 //   - turns technical failures into plain-English messages that say what to do next.
-// The API key is sent only in a request header. It never appears in URLs, logs or errors.
+// The API key is sent only in a request header. It never appears in URLs, logs, errors or the cache.
 
 import { loadConfig, type Config } from "./config.ts";
+import { DiskCache } from "./diskCache.ts";
 import { sourceFromCore, usableFullText, type Source } from "./models.ts";
 
 // ---------- the "transport": the one function that actually goes on the internet ----------
@@ -16,8 +18,8 @@ import { sourceFromCore, usableFullText, type Source } from "./models.ts";
 export interface TransportResponse {
   status: number;
   body: string;
-  /** The Retry-After header, if CORE sent one. */
-  retryAfter: string | null;
+  /** Response headers, with lower-case names. */
+  headers: Record<string, string>;
 }
 
 export type Transport = (
@@ -33,7 +35,7 @@ export const fetchTransport: Transport = async (url, init) => {
   return {
     status: response.status,
     body: await response.text(),
-    retryAfter: response.headers.get("retry-after"),
+    headers: Object.fromEntries(response.headers),
   };
 };
 
@@ -59,14 +61,27 @@ function friendlyHttpError(status: number): CoreApiError {
   if (status === 404) return new CoreApiError("CORE has no work with that ID.", status);
   if (status === 429) {
     return new CoreApiError(
-      "CORE is limiting how fast we can search. Wait a minute and try again.",
+      "CORE is limiting how fast we can search (10 requests a minute). Wait a minute and try again.",
       status,
     );
   }
   if (status >= 500) {
-    return new CoreApiError("CORE is having server trouble right now. Try again in a few minutes.", status);
+    return new CoreApiError(
+      "CORE had a server error with this request. Try again in a few minutes, or simplify the search " +
+        "(fewer OR terms or quoted phrases).",
+      status,
+    );
   }
   return new CoreApiError(`CORE refused the request (HTTP ${status}). Try rewording the search.`, status);
+}
+
+// ---------- reading CORE's rate-limit headers ----------
+
+/** CORE's X-RateLimit-Retry-After is a timestamp like "2026-10-22T01:05:42+0000". */
+export function parseResetTime(value: string | undefined): number | null {
+  if (!value) return null;
+  const time = Date.parse(value.trim().replace(/([+-]\d{2})(\d{2})$/, "$1:$2"));
+  return Number.isNaN(time) ? null : time;
 }
 
 // ---------- search options and results ----------
@@ -123,25 +138,36 @@ function clamp(value: number, min: number, max: number): number {
 export interface CoreClientOptions {
   config?: Config;
   transport?: Transport;
+  /** Where to keep answers between sessions. Pass null to turn the disk cache off (tests do). */
+  diskCache?: DiskCache | null;
   /** Pause function; tests replace it so they don't actually wait. */
   sleep?: (ms: number) => Promise<void>;
   /** Clock in milliseconds; tests replace it. */
   now?: () => number;
 }
 
+/** Never wait longer than this for CORE's allowance to reset; give a friendly error instead. */
+const MAX_WAIT_MS = 75_000;
+/** Server errors (5xx) are retried only this many times: a request that breaks CORE usually keeps breaking it. */
+const MAX_SERVER_ERROR_RETRIES = 1;
+
 const realSleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
 export class CoreClient {
   readonly config: Config;
   private readonly transport: Transport;
+  private readonly diskCache: DiskCache | null;
   private readonly sleep: (ms: number) => Promise<void>;
   private readonly now: () => number;
-  private readonly cache = new Map<string, unknown>();
+  private readonly memoryCache = new Map<string, unknown>();
   private lastRequestAt: number | null = null;
+  /** When CORE has told us our allowance is used up: don't send anything before this time. */
+  private blockedUntil = 0;
 
   constructor(options: CoreClientOptions = {}) {
     this.config = options.config ?? loadConfig();
     this.transport = options.transport ?? fetchTransport;
+    this.diskCache = options.diskCache === undefined ? new DiskCache() : options.diskCache;
     this.sleep = options.sleep ?? realSleep;
     this.now = options.now ?? Date.now;
   }
@@ -151,13 +177,7 @@ export class CoreClient {
   }
 
   async search(query: string, options: SearchOptions = {}): Promise<SearchResult> {
-    const fullQuery = buildQuery(query, options);
-    const params = new URLSearchParams({
-      q: fullQuery,
-      limit: String(clamp(options.limit ?? 10, 1, 100)),
-      offset: String(clamp(options.offset ?? 0, 0, 10_000)),
-    });
-    const data = await this.getJson(`/search/works?${params}`);
+    const { query: fullQuery, data } = await this.searchRaw(query, options);
     const record = (data ?? {}) as { totalHits?: unknown; results?: unknown };
 
     const results: Source[] = [];
@@ -171,6 +191,17 @@ export class CoreClient {
     }
     const totalHits = typeof record.totalHits === "number" ? record.totalHits : results.length;
     return { query: fullQuery, totalHits, results, skipped };
+  }
+
+  /** The search exactly as CORE returned it, before tidying. Used by scripts/inspectCore.ts. */
+  async searchRaw(query: string, options: SearchOptions = {}): Promise<{ query: string; data: unknown }> {
+    const fullQuery = buildQuery(query, options);
+    const params = new URLSearchParams({
+      q: fullQuery,
+      limit: String(clamp(options.limit ?? 10, 1, 100)),
+      offset: String(clamp(options.offset ?? 0, 0, 10_000)),
+    });
+    return { query: fullQuery, data: await this.getJson(`/search/works?${params}`) };
   }
 
   async getWork(coreId: string): Promise<Source> {
@@ -227,14 +258,22 @@ export class CoreClient {
     return this.getJson(`/works/${encodeURIComponent(id)}`);
   }
 
-  /** Fetches a path from CORE as JSON, using the cache, the pacing rule and retries. */
+  /** Fetches a path from CORE as JSON, using the caches, the pacing rules and retries. */
   private async getJson(pathAndQuery: string): Promise<unknown> {
     const url = `${this.config.coreBaseUrl}${pathAndQuery}`;
-    if (this.cache.has(url)) return this.cache.get(url);
+    // Answers differ with and without a key (full text), so the cache keeps them apart.
+    const cacheKey = `${this.hasApiKey ? "keyed" : "keyless"} ${url}`;
+    if (this.memoryCache.has(cacheKey)) return this.memoryCache.get(cacheKey);
+    const saved = this.diskCache?.get(cacheKey);
+    if (saved !== undefined) {
+      this.memoryCache.set(cacheKey, saved);
+      return saved;
+    }
 
     const headers: Record<string, string> = { Accept: "application/json" };
     if (this.config.coreApiKey) headers.Authorization = `Bearer ${this.config.coreApiKey}`;
 
+    let serverErrorRetries = 0;
     for (let attempt = 0; ; attempt += 1) {
       await this.waitForTurn();
       let response: TransportResponse;
@@ -242,15 +281,22 @@ export class CoreClient {
         response = await this.transport(url, { headers, timeoutMs: this.config.timeoutMs });
       } catch {
         if (attempt < this.config.maxRetries) {
-          await this.sleep(this.backoffMs(attempt, null));
+          await this.sleep(this.backoffMs(attempt));
           continue;
         }
         throw new CoreApiError("Couldn't reach CORE. Check your internet connection and try again.");
       }
+      this.noteRateLimit(response.headers);
 
-      const retryable = response.status === 429 || response.status >= 500;
-      if (retryable && attempt < this.config.maxRetries) {
-        await this.sleep(this.backoffMs(attempt, response.retryAfter));
+      if (response.status === 429 && attempt < this.config.maxRetries) {
+        const waitMs = this.rateLimitWaitMs(response.headers, attempt);
+        if (waitMs > MAX_WAIT_MS) throw this.tooLongError(this.now() + waitMs);
+        await this.sleep(waitMs);
+        continue;
+      }
+      if (response.status >= 500 && serverErrorRetries < MAX_SERVER_ERROR_RETRIES && attempt < this.config.maxRetries) {
+        serverErrorRetries += 1;
+        await this.sleep(this.backoffMs(attempt));
         continue;
       }
       if (response.status < 200 || response.status >= 300) throw friendlyHttpError(response.status);
@@ -261,24 +307,46 @@ export class CoreClient {
       } catch {
         throw new CoreApiError("CORE sent back something that isn't valid data. Try again shortly.");
       }
-      this.cache.set(url, data);
+      this.memoryCache.set(cacheKey, data);
+      this.diskCache?.set(cacheKey, data);
       return data;
     }
   }
 
-  /** Waits until at least `minIntervalMs` has passed since the previous request. */
+  /** Waits for the 1.5 s gap and for any pause CORE has asked for. */
   private async waitForTurn(): Promise<void> {
-    if (this.lastRequestAt !== null) {
-      const waitMs = this.lastRequestAt + this.config.minIntervalMs - this.now();
-      if (waitMs > 0) await this.sleep(waitMs);
-    }
+    const gapEnds = this.lastRequestAt === null ? 0 : this.lastRequestAt + this.config.minIntervalMs;
+    const waitMs = Math.max(gapEnds, this.blockedUntil) - this.now();
+    if (waitMs > MAX_WAIT_MS) throw this.tooLongError(this.now() + waitMs);
+    if (waitMs > 0) await this.sleep(waitMs);
     this.lastRequestAt = this.now();
   }
 
-  /** How long to wait before retrying: CORE's Retry-After if given, else 2 s, 4 s, 8 s... (max 60 s). */
-  private backoffMs(attempt: number, retryAfter: string | null): number {
-    const seconds = retryAfter !== null ? Number(retryAfter) : NaN;
-    if (Number.isFinite(seconds) && seconds >= 0) return Math.min(seconds * 1000, 60_000);
+  /** If CORE says no requests remain, remember when the allowance resets. */
+  private noteRateLimit(headers: Record<string, string>): void {
+    const remaining = Number(headers["x-ratelimit-remaining"]);
+    const resetAt = parseResetTime(headers["x-ratelimit-retry-after"]);
+    if (remaining === 0 && resetAt !== null) this.blockedUntil = resetAt + 500;
+  }
+
+  /** After a 429: wait until CORE's reset time, or its Retry-After seconds, or back off 2 s, 4 s, 8 s... */
+  private rateLimitWaitMs(headers: Record<string, string>, attempt: number): number {
+    const resetAt = parseResetTime(headers["x-ratelimit-retry-after"]);
+    if (resetAt !== null) return Math.max(resetAt + 500 - this.now(), 1000);
+    const seconds = Number(headers["retry-after"]);
+    if (Number.isFinite(seconds) && seconds >= 0) return seconds * 1000;
+    return this.backoffMs(attempt);
+  }
+
+  private backoffMs(attempt: number): number {
     return Math.min(2000 * 2 ** attempt, 60_000);
+  }
+
+  private tooLongError(untilMs: number): CoreApiError {
+    const at = new Date(untilMs).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    return new CoreApiError(
+      `CORE's request allowance is used up. Try again after about ${at}.`,
+      429,
+    );
   }
 }
