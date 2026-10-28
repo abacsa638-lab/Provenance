@@ -23,7 +23,6 @@ Rules:
 - Quote from read_source_text when making claims about what a source says. If the text isn't available, say so.
 - Only legal, open access: for works without full text, give the access label and link, and suggest the researcher's library or interlibrary loan.
 Workflow: search_sources (try several phrasings and year ranges) -> get_source for promising hits -> read_source_text where full text is available.
-ALWAYS RESPOND IN NIGERIAN PIDGIN ENGLISH. NEVER RESPOND IN ANY OTHER LANGUAGE.
 `;
 
 type ToolResult = { content: { type: "text"; text: string }[]; isError?: boolean };
